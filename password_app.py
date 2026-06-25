@@ -1,8 +1,9 @@
 import os
 import json
+import time
 import sqlite3
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 import pyotp
 from argon2 import PasswordHasher
@@ -59,10 +60,12 @@ def meta_get(key):
 def meta_set(key, value):
     conn = db_connect()
     cur = conn.cursor()
+
     cur.execute("""
         INSERT OR REPLACE INTO vault_meta (key, value)
         VALUES (?, ?)
     """, (key, value))
+
     conn.commit()
     conn.close()
 
@@ -103,7 +106,7 @@ def decrypt_record(dek, nonce, ciphertext):
     return json.loads(plaintext.decode())
 
 
-# ---------- VAULT SETUP / LOGIN ----------
+# ---------- VAULT ----------
 
 def vault_exists():
     return meta_get("master_hash") is not None
@@ -145,8 +148,7 @@ def unlock_vault(master_password):
     kek = derive_key(master_password, kdf_salt)
 
     try:
-        dek = decrypt_bytes(kek, dek_nonce, encrypted_dek)
-        return dek
+        return decrypt_bytes(kek, dek_nonce, encrypted_dek)
     except Exception:
         return None
 
@@ -204,12 +206,12 @@ def delete_authenticator(code_id):
 def open_main_window(dek):
     main = tk.Tk()
     main.title("Secure Authenticator Vault")
-    main.geometry("700x500")
+    main.geometry("800x550")
 
     lock_timer = None
 
     def lock_app():
-        messagebox.showinfo("Locked", "Vault locked due to inactivity")
+        messagebox.showinfo("Locked", "Vault locked due to inactivity.")
         main.destroy()
 
     def reset_lock_timer(event=None):
@@ -223,34 +225,110 @@ def open_main_window(dek):
     main.bind_all("<Key>", reset_lock_timer)
     main.bind_all("<Button>", reset_lock_timer)
 
+    tk.Label(
+        main,
+        text="Secure Authenticator Vault",
+        font=("Arial", 18)
+    ).pack(pady=15)
+
+    tree = ttk.Treeview(
+        main,
+        columns=("service", "username", "code", "expires"),
+        show="headings",
+        height=15
+    )
+
+    tree.heading("service", text="Service")
+    tree.heading("username", text="Username")
+    tree.heading("code", text="Authenticator Code")
+    tree.heading("expires", text="Expires")
+
+    tree.column("service", width=180)
+    tree.column("username", width=260)
+    tree.column("code", width=150, anchor="center")
+    tree.column("expires", width=80, anchor="center")
+
+    tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+    status_label = tk.Label(main, text="Ready", anchor="w")
+    status_label.pack(fill="x", padx=10, pady=5)
+
     def refresh_codes():
-        listbox.delete(0, tk.END)
+        remaining = 30 - (int(time.time()) % 30)
+        current_ids = set()
 
         for code_id, service, nonce, ciphertext in get_authenticators():
+            item_id = str(code_id)
+            current_ids.add(item_id)
+
             try:
                 data = decrypt_record(dek, nonce, ciphertext)
+
                 username = data["username"]
                 secret = data["secret"]
 
-                code = pyotp.TOTP(secret).now()
+                totp = pyotp.TOTP(secret)
+                code = totp.now()
+                formatted_code = f"{code[:3]} {code[3:]}"
 
-                listbox.insert(
-                    tk.END,
-                    f"{code_id} | {service} | {username} | Code: {code}"
+                values = (
+                    service,
+                    username,
+                    formatted_code,
+                    f"{remaining}s"
                 )
 
             except Exception:
-                listbox.insert(
-                    tk.END,
-                    f"{code_id} | {service} | Unable to decrypt"
+                values = (
+                    service,
+                    "Unable to decrypt",
+                    "------",
+                    ""
                 )
 
-        main.after(30000, refresh_codes)
+            if tree.exists(item_id):
+                tree.item(item_id, values=values)
+            else:
+                tree.insert(
+                    "",
+                    "end",
+                    iid=item_id,
+                    values=values
+                )
+
+        for item_id in tree.get_children():
+            if item_id not in current_ids:
+                tree.delete(item_id)
+
+        main.after(1000, refresh_codes)
+
+    def copy_selected_code():
+        selected = tree.selection()
+
+        if not selected:
+            messagebox.showerror("Error", "Please select an authenticator.")
+            return
+
+        values = tree.item(selected[0])["values"]
+        code = str(values[2]).replace(" ", "")
+
+        if not code or code == "------":
+            messagebox.showerror("Error", "No valid code to copy.")
+            return
+
+        main.clipboard_clear()
+        main.clipboard_append(code)
+        main.update()
+
+        status_label.config(text=f"Copied {code} to clipboard.")
+
+    tree.bind("<Double-1>", lambda event: copy_selected_code())
 
     def add_code_window():
         win = tk.Toplevel(main)
         win.title("Add Authenticator")
         win.geometry("400x320")
+        win.resizable(False, False)
 
         tk.Label(win, text="Service").pack(pady=5)
         service_entry = tk.Entry(win, width=40)
@@ -270,52 +348,77 @@ def open_main_window(dek):
             secret = secret_entry.get().replace(" ", "").strip()
 
             if not service or not username or not secret:
-                messagebox.showerror("Error", "All fields are required")
+                messagebox.showerror("Error", "All fields are required.")
                 return
 
             try:
                 pyotp.TOTP(secret).now()
             except Exception:
-                messagebox.showerror("Error", "Invalid authenticator secret")
+                messagebox.showerror("Error", "Invalid authenticator secret.")
                 return
 
             add_authenticator(service, username, secret, dek)
 
-            messagebox.showinfo("Saved", "Authenticator encrypted and saved")
+            messagebox.showinfo("Saved", "Authenticator encrypted and saved.")
             win.destroy()
             refresh_codes()
 
-        tk.Button(win, text="Save", command=save).pack(pady=20)
+        tk.Button(win, text="Save", width=15, command=save).pack(pady=20)
 
     def delete_selected():
-        selected = listbox.curselection()
+        selected = tree.selection()
 
         if not selected:
-            messagebox.showerror("Error", "Select an item first")
+            messagebox.showerror("Error", "Select an item first.")
             return
 
-        item = listbox.get(selected[0])
-        code_id = item.split("|")[0].strip()
+        code_id = selected[0]
+
+        confirm = messagebox.askyesno(
+            "Confirm Delete",
+            "Delete the selected authenticator?"
+        )
+
+        if not confirm:
+            return
 
         delete_authenticator(code_id)
+        status_label.config(text="Authenticator deleted.")
         refresh_codes()
 
-    tk.Label(
-        main,
-        text="Secure Authenticator Vault",
-        font=("Arial", 18)
-    ).pack(pady=15)
+    button_frame = tk.Frame(main)
+    button_frame.pack(pady=10)
 
-    listbox = tk.Listbox(main, width=95, height=15)
-    listbox.pack(pady=10)
+    tk.Button(
+        button_frame,
+        text="Add",
+        width=15,
+        command=add_code_window
+    ).grid(row=0, column=0, padx=5)
 
-    tk.Button(main, text="Add Authenticator", command=add_code_window).pack(pady=5)
-    tk.Button(main, text="Refresh Codes", command=refresh_codes).pack(pady=5)
-    tk.Button(main, text="Delete Selected", command=delete_selected).pack(pady=5)
-    tk.Button(main, text="Lock / Exit", command=main.destroy).pack(pady=20)
+    tk.Button(
+        button_frame,
+        text="Copy Code",
+        width=15,
+        command=copy_selected_code
+    ).grid(row=0, column=1, padx=5)
 
-    reset_lock_timer()
+    tk.Button(
+        button_frame,
+        text="Delete",
+        width=15,
+        command=delete_selected
+    ).grid(row=0, column=2, padx=5)
+
+    tk.Button(
+        button_frame,
+        text="Lock Vault",
+        width=15,
+        command=main.destroy
+    ).grid(row=0, column=3, padx=5)
+
     refresh_codes()
+    reset_lock_timer()
     main.mainloop()
 
 
@@ -343,14 +446,14 @@ def start_login_window():
             confirm = confirm_entry.get()
 
             if password != confirm:
-                messagebox.showerror("Error", "Passwords do not match")
+                messagebox.showerror("Error", "Passwords do not match.")
                 return
 
             try:
                 create_vault(password)
                 dek = unlock_vault(password)
 
-                messagebox.showinfo("Success", "Vault created")
+                messagebox.showinfo("Success", "Vault created.")
                 root.destroy()
                 open_main_window(dek)
 
@@ -371,11 +474,11 @@ def start_login_window():
             dek = unlock_vault(password)
 
             if dek:
-                messagebox.showinfo("Success", "Vault unlocked")
+                messagebox.showinfo("Success", "Vault unlocked.")
                 root.destroy()
                 open_main_window(dek)
             else:
-                messagebox.showerror("Error", "Wrong master password")
+                messagebox.showerror("Error", "Wrong master password.")
 
         tk.Button(root, text="Unlock Vault", command=login).pack(pady=20)
 
