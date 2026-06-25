@@ -36,9 +36,8 @@ def init_db():
     """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS authenticator_codes (
+        CREATE TABLE IF NOT EXISTS vault_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            service TEXT NOT NULL,
             nonce BLOB NOT NULL,
             ciphertext BLOB NOT NULL
         )
@@ -153,11 +152,13 @@ def unlock_vault(master_password):
         return None
 
 
-# ---------- AUTHENTICATOR STORAGE ----------
+# ---------- VAULT ENTRIES ----------
 
-def add_authenticator(service, username, secret, dek):
+def add_vault_entry(service, username, password, secret, dek):
     data = {
+        "service": service,
         "username": username,
+        "password": password,
         "secret": secret
     }
 
@@ -167,23 +168,23 @@ def add_authenticator(service, username, secret, dek):
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO authenticator_codes
-        (service, nonce, ciphertext)
-        VALUES (?, ?, ?)
-    """, (service, nonce, ciphertext))
+        INSERT INTO vault_entries
+        (nonce, ciphertext)
+        VALUES (?, ?)
+    """, (nonce, ciphertext))
 
     conn.commit()
     conn.close()
 
 
-def get_authenticators():
+def get_vault_entries():
     conn = db_connect()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, service, nonce, ciphertext
-        FROM authenticator_codes
-        ORDER BY service
+        SELECT id, nonce, ciphertext
+        FROM vault_entries
+        ORDER BY id
     """)
 
     rows = cur.fetchall()
@@ -191,11 +192,11 @@ def get_authenticators():
     return rows
 
 
-def delete_authenticator(code_id):
+def delete_vault_entry(entry_id):
     conn = db_connect()
     cur = conn.cursor()
 
-    cur.execute("DELETE FROM authenticator_codes WHERE id = ?", (code_id,))
+    cur.execute("DELETE FROM vault_entries WHERE id = ?", (entry_id,))
 
     conn.commit()
     conn.close()
@@ -205,13 +206,15 @@ def delete_authenticator(code_id):
 
 def open_main_window(dek):
     main = tk.Tk()
-    main.title("Secure Authenticator Vault")
-    main.geometry("800x550")
+    main.title("Secure Password and Authenticator Vault")
+    main.geometry("950x550")
 
     lock_timer = None
+    decrypted_cache = {}
 
     def lock_app():
         messagebox.showinfo("Locked", "Vault locked due to inactivity.")
+        decrypted_cache.clear()
         main.destroy()
 
     def reset_lock_timer(event=None):
@@ -227,24 +230,26 @@ def open_main_window(dek):
 
     tk.Label(
         main,
-        text="Secure Authenticator Vault",
+        text="Secure Password and Authenticator Vault",
         font=("Arial", 18)
     ).pack(pady=15)
 
     tree = ttk.Treeview(
         main,
-        columns=("service", "username", "code", "expires"),
+        columns=("service", "username", "password", "code", "expires"),
         show="headings",
         height=15
     )
 
     tree.heading("service", text="Service")
     tree.heading("username", text="Username")
+    tree.heading("password", text="Password")
     tree.heading("code", text="Authenticator Code")
     tree.heading("expires", text="Expires")
 
-    tree.column("service", width=180)
-    tree.column("username", width=260)
+    tree.column("service", width=200)
+    tree.column("username", width=250)
+    tree.column("password", width=120, anchor="center")
     tree.column("code", width=150, anchor="center")
     tree.column("expires", width=80, anchor="center")
 
@@ -257,133 +262,232 @@ def open_main_window(dek):
         remaining = 30 - (int(time.time()) % 30)
         current_ids = set()
 
-        for code_id, service, nonce, ciphertext in get_authenticators():
-            item_id = str(code_id)
+        entries = []
+
+        for entry_id, nonce, ciphertext in get_vault_entries():
+            item_id = str(entry_id)
             current_ids.add(item_id)
 
             try:
                 data = decrypt_record(dek, nonce, ciphertext)
+                decrypted_cache[item_id] = data
 
-                username = data["username"]
-                secret = data["secret"]
+                service = data.get("service", "")
+                username = data.get("username", "")
+                password = data.get("password", "")
+                secret = data.get("secret", "")
 
-                totp = pyotp.TOTP(secret)
-                code = totp.now()
-                formatted_code = f"{code[:3]} {code[3:]}"
+                code = "------"
+
+                if secret:
+                    totp = pyotp.TOTP(secret)
+                    raw_code = totp.now()
+                    code = f"{raw_code[:3]} {raw_code[3:]}"
+
+                password_display = "Saved" if password else "None"
 
                 values = (
                     service,
                     username,
-                    formatted_code,
+                    password_display,
+                    code,
                     f"{remaining}s"
                 )
 
+                entries.append((item_id, values))
+
             except Exception:
                 values = (
-                    service,
                     "Unable to decrypt",
+                    "",
+                    "Unknown",
                     "------",
                     ""
                 )
 
+                entries.append((item_id, values))
+
+        entries.sort(key=lambda item: str(item[1][0]).lower())
+
+        existing_ids = set(tree.get_children())
+
+        for item_id, values in entries:
             if tree.exists(item_id):
                 tree.item(item_id, values=values)
             else:
-                tree.insert(
-                    "",
-                    "end",
-                    iid=item_id,
-                    values=values
-                )
+                tree.insert("", "end", iid=item_id, values=values)
 
-        for item_id in tree.get_children():
+        for item_id in existing_ids:
             if item_id not in current_ids:
                 tree.delete(item_id)
+                decrypted_cache.pop(item_id, None)
 
         main.after(1000, refresh_codes)
 
-    def copy_selected_code():
+    def get_selected_item():
         selected = tree.selection()
 
         if not selected:
-            messagebox.showerror("Error", "Please select an authenticator.")
+            messagebox.showerror("Error", "Please select an entry.")
+            return None
+
+        return selected[0]
+
+    def copy_selected_username():
+        item_id = get_selected_item()
+
+        if not item_id:
             return
 
-        values = tree.item(selected[0])["values"]
-        code = str(values[2]).replace(" ", "")
+        data = decrypted_cache.get(item_id)
 
-        if not code or code == "------":
-            messagebox.showerror("Error", "No valid code to copy.")
+        if not data:
+            messagebox.showerror("Error", "Username is not available.")
+            return
+
+        username = data.get("username", "")
+
+        if not username:
+            messagebox.showerror("Error", "No username saved for this entry.")
+            return
+
+        main.clipboard_clear()
+        main.clipboard_append(username)
+        main.update()
+
+        status_label.config(text=f"Copied username: {username}")
+
+    def copy_selected_password():
+        item_id = get_selected_item()
+
+        if not item_id:
+            return
+
+        data = decrypted_cache.get(item_id)
+
+        if not data:
+            messagebox.showerror("Error", "Password is not available.")
+            return
+
+        password = data.get("password", "")
+
+        if not password:
+            messagebox.showerror("Error", "No password saved for this entry.")
+            return
+
+        main.clipboard_clear()
+        main.clipboard_append(password)
+        main.update()
+
+        status_label.config(text="Copied password to clipboard.")
+
+    def copy_selected_code():
+        item_id = get_selected_item()
+
+        if not item_id:
+            return
+
+        data = decrypted_cache.get(item_id)
+
+        if not data:
+            messagebox.showerror("Error", "Authenticator code is not available.")
+            return
+
+        secret = data.get("secret", "")
+
+        if not secret:
+            messagebox.showerror("Error", "No authenticator secret saved for this entry.")
+            return
+
+        try:
+            code = pyotp.TOTP(secret).now()
+        except Exception:
+            messagebox.showerror("Error", "Invalid authenticator secret.")
             return
 
         main.clipboard_clear()
         main.clipboard_append(code)
         main.update()
 
-        status_label.config(text=f"Copied {code} to clipboard.")
+        status_label.config(text=f"Copied code: {code}")
 
     tree.bind("<Double-1>", lambda event: copy_selected_code())
 
-    def add_code_window():
+    def add_entry_window():
         win = tk.Toplevel(main)
-        win.title("Add Authenticator")
-        win.geometry("400x320")
+        win.title("Add Vault Entry")
+        win.geometry("420x400")
         win.resizable(False, False)
 
         tk.Label(win, text="Service").pack(pady=5)
-        service_entry = tk.Entry(win, width=40)
+        service_entry = tk.Entry(win, width=42)
         service_entry.pack()
 
         tk.Label(win, text="Username / Email").pack(pady=5)
-        username_entry = tk.Entry(win, width=40)
+        username_entry = tk.Entry(win, width=42)
         username_entry.pack()
 
+        tk.Label(win, text="Password").pack(pady=5)
+        password_entry = tk.Entry(win, show="*", width=42)
+        password_entry.pack()
+
         tk.Label(win, text="Authenticator Secret Key").pack(pady=5)
-        secret_entry = tk.Entry(win, show="*", width=40)
+        secret_entry = tk.Entry(win, show="*", width=42)
         secret_entry.pack()
 
         def save():
             service = service_entry.get().strip()
             username = username_entry.get().strip()
+            password = password_entry.get()
             secret = secret_entry.get().replace(" ", "").strip()
 
-            if not service or not username or not secret:
-                messagebox.showerror("Error", "All fields are required.")
+            if not service:
+                messagebox.showerror("Error", "Service is required.")
                 return
 
-            try:
-                pyotp.TOTP(secret).now()
-            except Exception:
-                messagebox.showerror("Error", "Invalid authenticator secret.")
+            if not username:
+                messagebox.showerror("Error", "Username is required.")
                 return
 
-            add_authenticator(service, username, secret, dek)
+            if not password and not secret:
+                messagebox.showerror(
+                    "Error",
+                    "Enter a password, an authenticator secret, or both."
+                )
+                return
 
-            messagebox.showinfo("Saved", "Authenticator encrypted and saved.")
+            if secret:
+                try:
+                    pyotp.TOTP(secret).now()
+                except Exception:
+                    messagebox.showerror("Error", "Invalid authenticator secret.")
+                    return
+
+            add_vault_entry(service, username, password, secret, dek)
+
+            messagebox.showinfo("Saved", "Entry encrypted and saved.")
             win.destroy()
             refresh_codes()
 
         tk.Button(win, text="Save", width=15, command=save).pack(pady=20)
 
     def delete_selected():
-        selected = tree.selection()
+        item_id = get_selected_item()
 
-        if not selected:
-            messagebox.showerror("Error", "Select an item first.")
+        if not item_id:
             return
-
-        code_id = selected[0]
 
         confirm = messagebox.askyesno(
             "Confirm Delete",
-            "Delete the selected authenticator?"
+            "Delete the selected entry?"
         )
 
         if not confirm:
             return
 
-        delete_authenticator(code_id)
-        status_label.config(text="Authenticator deleted.")
+        delete_vault_entry(item_id)
+        decrypted_cache.pop(item_id, None)
+        status_label.config(text="Entry deleted.")
         refresh_codes()
 
     button_frame = tk.Frame(main)
@@ -393,29 +497,43 @@ def open_main_window(dek):
         button_frame,
         text="Add",
         width=15,
-        command=add_code_window
+        command=add_entry_window
     ).grid(row=0, column=0, padx=5)
+
+    tk.Button(
+        button_frame,
+        text="Copy Username",
+        width=15,
+        command=copy_selected_username
+    ).grid(row=0, column=1, padx=5)
+
+    tk.Button(
+        button_frame,
+        text="Copy Password",
+        width=15,
+        command=copy_selected_password
+    ).grid(row=0, column=2, padx=5)
 
     tk.Button(
         button_frame,
         text="Copy Code",
         width=15,
         command=copy_selected_code
-    ).grid(row=0, column=1, padx=5)
+    ).grid(row=0, column=3, padx=5)
 
     tk.Button(
         button_frame,
         text="Delete",
         width=15,
         command=delete_selected
-    ).grid(row=0, column=2, padx=5)
+    ).grid(row=0, column=4, padx=5)
 
     tk.Button(
         button_frame,
         text="Lock Vault",
         width=15,
         command=main.destroy
-    ).grid(row=0, column=3, padx=5)
+    ).grid(row=0, column=5, padx=5)
 
     refresh_codes()
     reset_lock_timer()
