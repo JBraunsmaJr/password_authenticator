@@ -37,3 +37,4 @@ I am looking to add more features
 - Logging
 - Secure Attachments
 - hotkey support
+- ssh key storage
