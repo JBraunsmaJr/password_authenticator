@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import sqlite3
@@ -105,6 +106,27 @@ def decrypt_record(dek, nonce, ciphertext):
     return json.loads(plaintext.decode())
 
 
+# ---------- MASTER PASSWORD POLICY ----------
+
+def validate_master_password(password):
+    if len(password) < 12:
+        return False, "Master password must be at least 12 characters long."
+
+    if not re.search(r"[A-Z]", password):
+        return False, "Master password must contain at least one uppercase letter."
+
+    if not re.search(r"[a-z]", password):
+        return False, "Master password must contain at least one lowercase letter."
+
+    if not re.search(r"\d", password):
+        return False, "Master password must contain at least one number."
+
+    if not re.search(r"[!@#$%^&*()_\-+=\[\]{};:'\",.<>/?\\|`~]", password):
+        return False, "Master password must contain at least one special character."
+
+    return True, ""
+
+
 # ---------- VAULT ----------
 
 def vault_exists():
@@ -112,8 +134,10 @@ def vault_exists():
 
 
 def create_vault(master_password):
-    if not master_password:
-        raise ValueError("Master password cannot be empty")
+    valid, message = validate_master_password(master_password)
+
+    if not valid:
+        raise ValueError(message)
 
     master_hash = ph.hash(master_password)
     kdf_salt = os.urandom(16)
@@ -261,7 +285,6 @@ def open_main_window(dek):
     def refresh_codes():
         remaining = 30 - (int(time.time()) % 30)
         current_ids = set()
-
         entries = []
 
         for entry_id, nonce, ciphertext in get_vault_entries():
@@ -304,7 +327,6 @@ def open_main_window(dek):
                     "------",
                     ""
                 )
-
                 entries.append((item_id, values))
 
         entries.sort(key=lambda item: str(item[1][0]).lower())
@@ -335,7 +357,6 @@ def open_main_window(dek):
 
     def copy_selected_username():
         item_id = get_selected_item()
-
         if not item_id:
             return
 
@@ -359,7 +380,6 @@ def open_main_window(dek):
 
     def copy_selected_password():
         item_id = get_selected_item()
-
         if not item_id:
             return
 
@@ -383,7 +403,6 @@ def open_main_window(dek):
 
     def copy_selected_code():
         item_id = get_selected_item()
-
         if not item_id:
             return
 
@@ -473,7 +492,6 @@ def open_main_window(dek):
 
     def delete_selected():
         item_id = get_selected_item()
-
         if not item_id:
             return
 
@@ -493,47 +511,12 @@ def open_main_window(dek):
     button_frame = tk.Frame(main)
     button_frame.pack(pady=10)
 
-    tk.Button(
-        button_frame,
-        text="Add",
-        width=15,
-        command=add_entry_window
-    ).grid(row=0, column=0, padx=5)
-
-    tk.Button(
-        button_frame,
-        text="Copy Username",
-        width=15,
-        command=copy_selected_username
-    ).grid(row=0, column=1, padx=5)
-
-    tk.Button(
-        button_frame,
-        text="Copy Password",
-        width=15,
-        command=copy_selected_password
-    ).grid(row=0, column=2, padx=5)
-
-    tk.Button(
-        button_frame,
-        text="Copy Code",
-        width=15,
-        command=copy_selected_code
-    ).grid(row=0, column=3, padx=5)
-
-    tk.Button(
-        button_frame,
-        text="Delete",
-        width=15,
-        command=delete_selected
-    ).grid(row=0, column=4, padx=5)
-
-    tk.Button(
-        button_frame,
-        text="Lock Vault",
-        width=15,
-        command=main.destroy
-    ).grid(row=0, column=5, padx=5)
+    tk.Button(button_frame, text="Add", width=15, command=add_entry_window).grid(row=0, column=0, padx=5)
+    tk.Button(button_frame, text="Copy Username", width=15, command=copy_selected_username).grid(row=0, column=1, padx=5)
+    tk.Button(button_frame, text="Copy Password", width=15, command=copy_selected_password).grid(row=0, column=2, padx=5)
+    tk.Button(button_frame, text="Copy Code", width=15, command=copy_selected_code).grid(row=0, column=3, padx=5)
+    tk.Button(button_frame, text="Delete", width=15, command=delete_selected).grid(row=0, column=4, padx=5)
+    tk.Button(button_frame, text="Lock Vault", width=15, command=main.destroy).grid(row=0, column=5, padx=5)
 
     refresh_codes()
     reset_lock_timer()
@@ -545,18 +528,32 @@ def open_main_window(dek):
 def start_login_window():
     root = tk.Tk()
     root.title("Vault Login")
-    root.geometry("350x260")
+    root.geometry("390x390")
     root.resizable(False, False)
 
     if not vault_exists():
-        tk.Label(root, text="Create Master Password", font=("Arial", 14)).pack(pady=15)
+        tk.Label(root, text="Create Master Password", font=("Arial", 14)).pack(pady=10)
+
+        tk.Label(
+            root,
+            text=(
+                "Password requirements:\n"
+                "• At least 12 characters\n"
+                "• At least one uppercase letter\n"
+                "• At least one lowercase letter\n"
+                "• At least one number\n"
+                "• At least one special character"
+            ),
+            justify="left",
+            fg="green"
+        ).pack(pady=5)
 
         tk.Label(root, text="Password").pack()
-        password_entry = tk.Entry(root, show="*", width=30)
+        password_entry = tk.Entry(root, show="*", width=35)
         password_entry.pack(pady=5)
 
         tk.Label(root, text="Confirm Password").pack()
-        confirm_entry = tk.Entry(root, show="*", width=30)
+        confirm_entry = tk.Entry(root, show="*", width=35)
         confirm_entry.pack(pady=5)
 
         def create():
@@ -576,7 +573,7 @@ def start_login_window():
                 open_main_window(dek)
 
             except ValueError as error:
-                messagebox.showerror("Error", str(error))
+                messagebox.showerror("Weak Password", str(error))
 
         tk.Button(root, text="Create Vault", command=create).pack(pady=20)
 
@@ -584,7 +581,7 @@ def start_login_window():
         tk.Label(root, text="Enter Master Password", font=("Arial", 14)).pack(pady=20)
 
         tk.Label(root, text="Password").pack()
-        password_entry = tk.Entry(root, show="*", width=30)
+        password_entry = tk.Entry(root, show="*", width=35)
         password_entry.pack(pady=5)
 
         def login():
