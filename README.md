@@ -32,3 +32,8 @@ I am looking to add more features
 - Clipboard auto-clear after 30 seconds.
 - Editing existing authenticators.
 - Sorting and filtering.
+- Chrome Extension
+- biometric unlocking (Windows Hello) / TouchID
+- Logging
+- Secure Attachments
+- hotkey support
