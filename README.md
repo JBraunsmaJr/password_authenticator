@@ -1,4 +1,4 @@
-# NxTPass
+<img width="357" height="327" alt="NxTPass-Logo" src="https://github.com/user-attachments/assets/9d7e3dbe-ccc7-4981-85c3-9047a82d08d5" />
 
 ## Desktop Password Authenticator and MFA Tool 
 
