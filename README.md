@@ -27,6 +27,7 @@ I am looking to add more features
 - Automatic database backups.
 - Secure export/import.
 - Windows installer and executable.
+- Mac pkg or dmg
 - Auto-lock after inactivity.
 - Clipboard auto-clear after 30 seconds.
 - Editing existing authenticators.
