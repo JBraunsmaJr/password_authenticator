@@ -27,7 +27,6 @@ I am looking to add more features
 - Automatic database backups.
 - Windows installer and executable.
 - Mac pkg or dmg
-- Auto-lock after inactivity.
 - Sorting and filtering.
 - Chrome Extension
 - biometric unlocking (Windows Hello) / TouchID
@@ -36,7 +35,9 @@ I am looking to add more features
 - hotkey support
 - ssh key storage
 
+<img width="464" height="919" alt="create-vault" src="https://github.com/user-attachments/assets/23108817-b125-45a1-a4d5-dcb8f66c387b" />
+<img width="370" height="471" alt="vault-login" src="https://github.com/user-attachments/assets/25f16aed-9e7c-41eb-ad93-c9c196150111" />
+<img width="1038" height="676" alt="codes" src="https://github.com/user-attachments/assets/4ae621a4-00c8-4b26-b85f-8512d3664078" />
+<img width="1053" height="687" alt="add-code" src="https://github.com/user-attachments/assets/b2a87820-af7a-4b3f-9339-faf91731f80b" />
 
-<img width="467" height="849" alt="NxTPass-Login" src="https://github.com/user-attachments/assets/c4fc1595-3722-4475-9ce7-b699bc425c2c" />
-<img width="1168" height="620" alt="NxtPass-Main" src="https://github.com/user-attachments/assets/76efddfb-2cfc-4cf2-9d1e-b4e91304ca26" />
-<img width="1164" height="624" alt="NxtPass-Add" src="https://github.com/user-attachments/assets/dd7c99b7-a909-4a9a-be8d-84270775d9b0" />
+
