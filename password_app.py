@@ -4,15 +4,14 @@ import json
 import time
 import sqlite3
 import tkinter as tk
+from contextlib import closing
 from tkinter import messagebox, ttk, filedialog, simpledialog
 
 import pyotp
 import qrcode
 from PIL import Image, ImageTk
 
-from argon2 import PasswordHasher
 from argon2.low_level import hash_secret_raw, Type
-from argon2.exceptions import VerifyMismatchError, VerificationError
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
@@ -25,9 +24,6 @@ CLIPBOARD_CLEAR_MS = 30 * 1000
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_LOCKOUT_SECONDS = 10 * 60
 
-ph = PasswordHasher()
-
-
 def load_logo(width=100):
     if not os.path.exists(LOGO_FILE):
         return None
@@ -37,51 +33,41 @@ def load_logo(width=100):
     return ImageTk.PhotoImage(image)
 
 
-def db_connect():
-    return sqlite3.connect(DB_FILE)
-
-
 def init_db():
-    conn = db_connect()
-    cur = conn.cursor()
+    with conn:
+        conn.execute("PRAGMA secure_delete = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vault_meta (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            )
+        """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS vault_meta (
-            key TEXT PRIMARY KEY,
-            value BLOB NOT NULL
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS vault_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nonce BLOB NOT NULL,
-            ciphertext BLOB NOT NULL
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS vault_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )
+        """)
+    # transaction is committed automatically on success
+    # On exception: auto-rolls back, then re-raises the exception
 
 
 def meta_get(key):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM vault_meta WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
+    with conn:
+        cur = conn.execute("SELECT value FROM vault_meta WHERE key = ?", (key,))
+        row = cur.fetchone()
     return row[0] if row else None
 
 
 def meta_set(key, value):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR REPLACE INTO vault_meta (key, value)
-        VALUES (?, ?)
-    """, (key, value))
-    conn.commit()
-    conn.close()
+    with conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO vault_meta (key, value)
+            VALUES (?, ?)
+        """, (key, value))
 
 
 def meta_get_text(key, default=""):
@@ -95,13 +81,13 @@ def meta_set_text(key, value):
     meta_set(key, str(value).encode())
 
 
-def derive_key(master_password, salt):
+def derive_key(master_password, salt, time_cost=3, memory_cost=65536, parallelism=2):
     return hash_secret_raw(
         secret=master_password.encode(),
         salt=salt,
-        time_cost=3,
-        memory_cost=65536,
-        parallelism=2,
+        time_cost=time_cost,
+        memory_cost=memory_cost,
+        parallelism=parallelism,
         hash_len=32,
         type=Type.ID
     )
@@ -121,11 +107,24 @@ def decrypt_bytes(key, nonce, ciphertext):
 
 def encrypt_record(dek, data):
     plaintext = json.dumps(data).encode()
+    # Add padding to hide length: pad to multiple of 64 bytes
+    pad_len = 64 - (len(plaintext) % 64)
+    plaintext += bytes([pad_len] * pad_len)
     return encrypt_bytes(dek, plaintext)
 
 
 def decrypt_record(dek, nonce, ciphertext):
     plaintext = decrypt_bytes(dek, nonce, ciphertext)
+    # Remove padding
+    if not plaintext:
+        return None
+    pad_len = plaintext[-1]
+    if pad_len > 0 and pad_len <= 64:
+        # Verify padding: all pad_len bytes must be equal to pad_len
+        if plaintext[-pad_len:] == bytes([pad_len] * pad_len):
+            plaintext = plaintext[:-pad_len]
+        else:
+            raise ValueError("Invalid padding")
     return json.loads(plaintext.decode())
 
 
@@ -186,7 +185,7 @@ def reset_failed_logins():
 
 
 def vault_exists():
-    return meta_get("master_hash") is not None
+    return meta_get("encrypted_dek") is not None
 
 
 def create_vault(master_password, twofa_secret):
@@ -195,21 +194,29 @@ def create_vault(master_password, twofa_secret):
     if not valid:
         raise ValueError(message)
 
-    master_hash = ph.hash(master_password)
     kdf_salt = os.urandom(16)
 
-    kek = derive_key(master_password, kdf_salt)
+    # Use stronger Argon2id parameters for new vaults
+    time_cost = 3
+    memory_cost = 262144  # 256MB
+    parallelism = 4
+
+    kek = derive_key(master_password, kdf_salt, time_cost, memory_cost, parallelism)
     dek = os.urandom(32)
 
     dek_nonce, encrypted_dek = encrypt_bytes(kek, dek)
     twofa_nonce, encrypted_twofa_secret = encrypt_bytes(dek, twofa_secret.encode())
 
-    meta_set("master_hash", master_hash.encode())
     meta_set("kdf_salt", kdf_salt)
     meta_set("dek_nonce", dek_nonce)
     meta_set("encrypted_dek", encrypted_dek)
     meta_set("twofa_nonce", twofa_nonce)
     meta_set("encrypted_twofa_secret", encrypted_twofa_secret)
+
+    # Store KDF parameters to allow future upgrades and ensure portability
+    meta_set_text("argon2_time", time_cost)
+    meta_set_text("argon2_mem", memory_cost)
+    meta_set_text("argon2_par", parallelism)
 
     reset_failed_logins()
 
@@ -218,25 +225,24 @@ def unlock_vault(master_password, twofa_code):
     if is_login_locked():
         return None
 
-    master_hash = meta_get("master_hash")
-
-    if not master_hash:
-        return None
-
-    try:
-        ph.verify(master_hash.decode(), master_password)
-    except (VerifyMismatchError, VerificationError):
-        return None
-
     kdf_salt = meta_get("kdf_salt")
     dek_nonce = meta_get("dek_nonce")
     encrypted_dek = meta_get("encrypted_dek")
 
-    kek = derive_key(master_password, kdf_salt)
+    if not kdf_salt or not dek_nonce or not encrypted_dek:
+        return None
+
+    # Load KDF parameters, defaulting to old values for compatibility
+    time_cost = int(meta_get_text("argon2_time", "3"))
+    memory_cost = int(meta_get_text("argon2_mem", "65536"))
+    parallelism = int(meta_get_text("argon2_par", "2"))
+
+    kek = derive_key(master_password, kdf_salt, time_cost, memory_cost, parallelism)
 
     try:
         dek = decrypt_bytes(kek, dek_nonce, encrypted_dek)
     except Exception:
+        # Decryption failure means wrong password
         return None
 
     twofa_nonce = meta_get("twofa_nonce")
@@ -270,15 +276,12 @@ def add_vault_entry(service, username, password, secret, dek):
 
     nonce, ciphertext = encrypt_record(dek, data)
 
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO vault_entries
-        (nonce, ciphertext)
-        VALUES (?, ?)
-    """, (nonce, ciphertext))
-    conn.commit()
-    conn.close()
+    with conn:
+        conn.execute("""
+            INSERT INTO vault_entries
+            (nonce, ciphertext)
+            VALUES (?, ?)
+        """, (nonce, ciphertext))
 
 
 def update_vault_entry(entry_id, service, username, password, secret, dek):
@@ -291,45 +294,37 @@ def update_vault_entry(entry_id, service, username, password, secret, dek):
 
     nonce, ciphertext = encrypt_record(dek, data)
 
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE vault_entries
-        SET nonce = ?, ciphertext = ?
-        WHERE id = ?
-    """, (nonce, ciphertext, entry_id))
-    conn.commit()
-    conn.close()
+    with conn:
+        conn.execute("""
+            UPDATE vault_entries
+            SET nonce = ?, ciphertext = ?
+            WHERE id = ?
+        """, (nonce, ciphertext, entry_id))
 
 
 def get_vault_entries():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, nonce, ciphertext
-        FROM vault_entries
-        ORDER BY id
-    """)
-    rows = cur.fetchall()
-    conn.close()
+    with conn:
+        cur = conn.execute("""
+            SELECT id, nonce, ciphertext
+            FROM vault_entries
+            ORDER BY id
+        """)
+        rows = cur.fetchall()
     return rows
 
 
 def delete_vault_entry(entry_id):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM vault_entries WHERE id = ?", (entry_id,))
-    conn.commit()
-    conn.close()
+    with conn:
+        conn.execute("DELETE FROM vault_entries WHERE id = ?", (entry_id,))
 
 
-def derive_backup_key(backup_password, salt):
+def derive_backup_key(backup_password, salt, time_cost=3, memory_cost=262144, parallelism=4):
     return hash_secret_raw(
         secret=backup_password.encode(),
         salt=salt,
-        time_cost=3,
-        memory_cost=65536,
-        parallelism=2,
+        time_cost=time_cost,
+        memory_cost=memory_cost,
+        parallelism=parallelism,
         hash_len=32,
         type=Type.ID
     )
@@ -358,14 +353,20 @@ def export_encrypted_backup():
         db_bytes = f.read()
 
     salt = os.urandom(16)
-    key = derive_backup_key(backup_password, salt)
+    time_cost = 3
+    memory_cost = 262144
+    parallelism = 4
+    key = derive_backup_key(backup_password, salt, time_cost, memory_cost, parallelism)
     nonce, ciphertext = encrypt_bytes(key, db_bytes)
 
     backup_data = {
         "version": 1,
         "salt": salt.hex(),
         "nonce": nonce.hex(),
-        "ciphertext": ciphertext.hex()
+        "ciphertext": ciphertext.hex(),
+        "argon2_time": time_cost,
+        "argon2_mem": memory_cost,
+        "argon2_par": parallelism
     }
 
     with open(file_path, "w") as f:
@@ -408,7 +409,12 @@ def import_encrypted_backup():
         nonce = bytes.fromhex(backup_data["nonce"])
         ciphertext = bytes.fromhex(backup_data["ciphertext"])
 
-        key = derive_backup_key(backup_password, salt)
+        # Load Argon2 parameters from backup, with defaults for older backups
+        time_cost = int(backup_data.get("argon2_time", 3))
+        memory_cost = int(backup_data.get("argon2_mem", 65536))
+        parallelism = int(backup_data.get("argon2_par", 2))
+
+        key = derive_backup_key(backup_password, salt, time_cost, memory_cost, parallelism)
         db_bytes = decrypt_bytes(key, nonce, ciphertext)
 
         with open(DB_FILE, "wb") as f:
@@ -1005,6 +1011,6 @@ def start_login_window():
 
     root.mainloop()
 
-
-init_db()
-start_login_window()
+with closing(sqlite3.connect(DB_FILE)) as conn:
+    init_db()
+    start_login_window()
