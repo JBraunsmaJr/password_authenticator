@@ -22,7 +22,7 @@ jobs:
       - name: Install Bandit
         run: pip install bandit
       - name: Run Bandit
-        run: bandit -r . -f sarif -o bandit-results.sarif --exit-zero
+        run: bandit -r . -f html -o bandit-results.html --exit-zero
         # --exit-zero so the job doesn't hard-fail; you still see results in the Security tab
       - name: Upload Bandit results
         uses: github/codeql-action/upload-sarif@v3
